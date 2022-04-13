@@ -1,4 +1,4 @@
-// package symnotify provides a file system watcher that notifies events for symlink targets.
+// package symnotify provides a recursive file system watcher that tracks symlinks as well as regular files.
 //
 package symnotify
 

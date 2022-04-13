@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/ViaQ/logerr/log"
 	"github.com/log-file-metric-exporter/pkg/symnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -247,4 +248,9 @@ func TestWatchesSubdirectories(t *testing.T) {
 	if errw == nil && nw > 0 {
 		assert.Equal(f.Event(), symnotify.Event{Name: log4, Op: symnotify.Write})
 	}
+}
+
+func TestMain(m *testing.M) {
+	log.SetLogLevel(3)
+	m.Run()
 }

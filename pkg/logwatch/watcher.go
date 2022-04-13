@@ -4,6 +4,7 @@ package logwatch
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,7 +15,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-var logFile = regexp.MustCompile(`/([a-z0-9-]+)_([a-z0-9-]+)_([a-f0-9-]+)/([a-z0-9-]+)/.*\.log`)
+var (
+	logFile   = regexp.MustCompile(`/([a-z0-9-]+)_([a-z0-9-]+)_([a-f0-9-]+)/([a-z0-9-]+)/.*\.log`)
+	logPodDir = regexp.MustCompile(`/([a-z0-9-]+)_([a-z0-9-]+)_([a-f0-9-]+)$`)
+)
 
 // LogLabels are the labels for a Pod log file.
 //
@@ -36,7 +40,7 @@ func (l *LogLabels) Parse(path string) (ok bool) {
 type Watcher struct {
 	watcher *symnotify.Watcher
 	metrics *prometheus.CounterVec
-	sizes   map[LogLabels]float64
+	sizes   map[string]float64
 }
 
 func New(dir string) (*Watcher, error) {
@@ -51,15 +55,17 @@ func New(dir string) (*Watcher, error) {
 			Name: "log_logged_bytes_total",
 			Help: "Total number of bytes written to a single log file path, accounting for rotations",
 		}, []string{"namespace", "podname", "poduuid", "containername"}),
-		sizes: make(map[LogLabels]float64),
+		sizes: make(map[string]float64),
 	}
 	if err := prometheus.Register(w.metrics); err != nil {
-		return nil, fmt.Errorf("error registering metrics: %w", err)
+		return nil, err
 	}
-	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error { return w.Update(path) })
-	err = w.watcher.Add(dir)
-	if err != nil {
-		return nil, fmt.Errorf("error watching directory %v: %w", dir, err)
+	if err := w.watcher.Add(dir); err != nil {
+		return nil, err
+	}
+	update := func(path string, info os.FileInfo, err error) error { w.Update(path); return nil }
+	if err := filepath.Walk(dir, update); err != nil {
+		return nil, err
 	}
 	return w, nil
 }
@@ -69,52 +75,57 @@ func (w *Watcher) Close() {
 	prometheus.Unregister(w.metrics)
 }
 
-func (w *Watcher) Update(path string) (err error) {
+func (w *Watcher) Update(path string) {
+	var err error
 	defer func() {
-		if os.IsNotExist(err) {
-			w.Forget(path)
-			err = nil // Not an error if a file disappears
-		}
-		if err != nil {
-			log.Error(err, "error updating metric", "path", path)
+		if err != nil && !os.IsNotExist(err) {
+			log.Error(err, "updating metric", "path", path)
 		}
 	}()
 
 	var l LogLabels
-	if !l.Parse(path) {
-		return nil
+	if l.Parse(path) { // Update metric for a log file
+		var stat os.FileInfo
+		stat, err = os.Stat(path)
+		if err != nil {
+			return
+		}
+		counter, err := w.metrics.GetMetricWithLabelValues(l.Namespace, l.Name, l.UUID, l.Container)
+		if err != nil {
+			return
+		}
+		lastSize, size := w.sizes[path], float64(stat.Size())
+		w.sizes[path] = size
+		var add float64
+		if size >= lastSize {
+			// File is static or has grown, add the difference to the counter.
+			add = size - lastSize
+		} else {
+			// File has been truncated, treat like a new file.
+			add = size
+		}
+		counter.Add(add)
+		log.V(3).Info("updated metric", "path", path, "size", size)
+		return
 	}
-	counter, err := w.metrics.GetMetricWithLabelValues(l.Namespace, l.Name, l.UUID, l.Container)
-	if err != nil {
-		return err
+	if infos, err := ioutil.ReadDir(path); err == nil { // Scan directories
+		for _, info := range infos {
+			w.Update(filepath.Join(path, info.Name()))
+		}
 	}
-	stat, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if stat.IsDir() {
-		return nil // Ignore directories
-	}
-	lastSize, size := w.sizes[l], float64(stat.Size())
-	w.sizes[l] = size
-	var add float64
-	if size > lastSize {
-		// File has grown, add the difference to the counter.
-		add = size - lastSize
-	} else if size < lastSize {
-		// File truncated, starting over. Add the size.
-		add = size
-	}
-	log.V(3).Info("updated metric", "path", path, "lastsize", lastSize, "currentsize", size, "addedbytes", add)
-	counter.Add(add)
-	return nil
 }
 
-func (w *Watcher) Forget(path string) {
-	var l LogLabels
-	if l.Parse(path) {
-		delete(w.sizes, l) // Clean up sizes entry
-		_ = w.metrics.DeleteLabelValues(l.Namespace, l.Name, l.UUID, l.Container)
+func (w *Watcher) Remove(path string) {
+	if logPodDir.FindStringSubmatch(path) != nil { // This is a pod log directory
+		for k, _ := range w.sizes { // Remove all counters for containers under this pod dir.
+			if filepath.HasPrefix(k, path) {
+				delete(w.sizes, k)
+				var l LogLabels
+				if l.Parse(k) {
+					_ = w.metrics.DeleteLabelValues(l.Namespace, l.Name, l.UUID, l.Container)
+				}
+			}
+		}
 	}
 }
 
@@ -127,7 +138,7 @@ func (w *Watcher) Watch() error {
 		case err != nil:
 			return err
 		case e.Op == fsnotify.Remove:
-			w.Forget(e.Name)
+			w.Remove(e.Name)
 		default:
 			w.Update(e.Name)
 		}
